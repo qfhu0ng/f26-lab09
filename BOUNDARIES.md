@@ -139,31 +139,112 @@ Where each arrow is in the code:
 
 ## Milestone 2: Run it as copies
 
-**Your stack.** The command that brought the stack up with two copies, and how
-many distinct `X-Upstream` values your runs saw.
+**Your stack.** `docker compose up -d --build --scale api=2`, with
+`compose.yaml` at the root. Scripts run with
+`docker compose run --rm --no-deps k6 run /load/<script>.js`. Twenty
+`GET /health` requests through the proxy saw 2 distinct `X-Upstream` values
+(8 and 12 answers), and every two-copy run below saw both copies in its
+`setup()`.
 
 ### Finding 1: tokens
 
-**The claim.** One sentence, the one your script checks.
+**The claim.** A token works on any request, whichever copy answers it.
 
-**The script and its result.** The file in `load/`, its threshold, and what a
-run printed.
+**The script and its result.** `load/tokens.js`. One VU sends
+`GET /bookings` through the proxy 40 times with the member token one copy
+printed at startup. Threshold: `token_accepted` `rate==1`, so every request
+has to come back 200. `setup()` aborts the run unless at least `MIN_COPIES`
+copies (default 2) answer `/health` through the proxy, so a run that reached
+one copy cannot pass. Two copies, token from `api-1` (172.19.0.3):
 
-**Why, from the code.** The class that keeps tokens and how it is wired into
-each copy. Say how you found it.
+```
+copies answering: 172.19.0.3:8080, 172.19.0.2:8080
+172.19.0.2:8080: {"401":21}
+172.19.0.3:8080: {"200":19}
+✗ 'rate==1' rate=47.50%
+```
 
-**The kind of problem.** Use the vocabulary from lecture.
+k6 exited 99. Every request the issuing copy answered was a 200, and every one
+the other copy answered was a 401. Scaled to one copy (`--scale api=1`, which
+kept `api-2`), the guard stopped the run with the default `MIN_COPIES`
+("1 copy answered through the proxy, wanted 2.", exit 108). With
+`MIN_COPIES=1` and `api-2`'s own token, all 40 were 200 and the threshold
+passed (exit 0). So the script can pass, and the failure at two copies comes
+from the copies rather than from the token or the script.
+
+**Why, from the code.** Tokens live in `TokenService.byValue`, a
+`LinkedHashMap` field of one `TokenService` instance (`TokenService.java`,
+line 31). The only `new TokenService` in production code is in the
+`CampusReservePlatform` constructor (line 53), and each copy's
+`CampusReserveServer.main` builds its own platform (line 26) and issues its own
+two tokens from `TokenMinter.random()` (lines 35–36). A token is looked up
+only in the answering copy's map: `RequestAuth.require` (line 30) calls
+`AuthorizationService.authenticate`, where `tokens.find` comes back empty for
+a token this copy never issued and the result is `INVALID_TOKEN` (lines
+43–45). `DenialReason.suggestedHttpStatus` (line 65) makes that a 401, with
+body `{"error":"invalid_token",...}`. Nothing copies tokens between
+processes. Found by following B3–B5 in the Milestone 1 sketch, then
+`grep -rn "new TokenService" --include='*.java' */src/main` for the one place
+the map is created.
+
+**The kind of problem.** The api is a stateful service. Session state (the
+token map) lives in one copy's memory, so the copies are not interchangeable,
+and "any copy can serve any request", which horizontal scaling relies on,
+does not hold. The state has no home outside a copy. It is not a race: one VU
+sending one request at a time sees it.
 
 ### Finding 2: bookings
 
-**The claim.**
+**The claim.** A room slot is booked at most once.
 
-**The script and its result.** Say how it reaches each copy directly, and why
-it has to.
+**The script and its result.** `load/bookings.js`. It asks for one room slot
+twice: u-1 on copy A, then u-2 on copy B. Threshold: `slot_confirmed`
+`count==1`, so twice breaks the claim and never means the run could not book;
+and `unexpected_status` `rate==0`, so every answer has to be 201 confirmed or
+202 waitlisted. `setup()` picks a slot both copies' availability shows as
+free, and aborts unless A refuses B's token (`MIN_COPIES`, default 2), so A
+and B cannot quietly be the same copy. Copy A `f26-lab09-api-2`, copy B
+`f26-lab09-api-3`:
 
-**Why, from the code.**
+```
+slot: r-1 from 2026-10-31T06:00:00Z for 60 minutes
+copy A (http://f26-lab09-api-2:8080): 201 confirmed
+copy B (http://f26-lab09-api-3:8080): 201 confirmed
+✗ 'count==1' count=2
+✓ 'rate==0' rate=0.00%
+```
 
-**The kind of problem.**
+k6 exited 99, and each copy's `/health` afterwards showed `"bookings":1`. With
+A and B both pointed at `api-2`, the guard stopped the default run ("A
+accepted B's token, so A and B look like the same copy.", exit 108). With
+`MIN_COPIES=1`, the same copy answered `201 confirmed` and then
+`202 waitlisted` for the next free slot, and both thresholds passed (exit 0).
+
+It reaches each copy by its container name inside the stack
+(`http://f26-lab09-api-2:8080`, from `docker compose ps`), with a token that
+copy printed. It has to: through the proxy, about half the requests would land
+on the copy that never issued their token and come back 401 (Finding 1), and
+a 401 says nothing about the slot.
+
+**Why, from the code.** Each copy has its own bookings. The only
+`new InMemoryBookingStore()` in production code is in the `StoreRegistry`
+constructor (line 25, the waitlist's is line 26), `CampusReservePlatform`
+builds one registry per platform with `StoreRegistry.inMemory()` (line 44),
+and each copy's `CampusReserveServer.main` builds its own platform (line 26).
+`BookingService.requestBooking` checks the slot against
+`bookings.findActiveByRoom` (line 112), which reads only the answering copy's
+store. On copy B that list was empty, so `ConflictChecker.hasConflict`
+(line 113) found nothing and the booking was saved (line 124). On one copy, the
+second request found the first booking there and went to `joinWaitlist`
+instead. Found by following B6–B8 in the Milestone 1 sketch, then
+`grep -rn "new InMemoryBookingStore" --include='*.java' */src/main`.
+
+**The kind of problem.** A check-then-insert whose check reads one copy's
+state. Bookings and the waitlist have no single owner: each copy keeps its own
+copy of the data and never hears about the other's writes, so the
+no-double-booking invariant holds per copy and not for the system. It is not a
+race. The two requests were one after the other, so a lock inside
+`BookingService` would not help, since it would only guard one copy's memory.
 
 ### What you checked
 

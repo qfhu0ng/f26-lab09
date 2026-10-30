@@ -1,0 +1,26 @@
+# CampusReserve as copies behind a proxy.
+#
+#   docker compose up -d --build --scale api=2
+#   docker compose run --rm --no-deps k6 run /load/<script>.js
+#
+# api publishes no port: callers come in through the proxy, or reach one copy
+# directly by the name `docker compose ps` gives it, from inside the stack.
+services:
+  api:
+    build: .
+
+  proxy:
+    image: nginx:1.27.3-alpine
+    volumes:
+      - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+  # Only runs when asked for (`docker compose run`), never with `up`.
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: ["load"]
+    volumes:
+      - ./load:/load:ro
