@@ -87,3 +87,10 @@ python -m campusreserve_analytics revenue --events ../events.jsonl --format csv
 - Architecture: `ARCHITECTURE.md`
 - Setup and the per-module gates: `SETUP.md`
 - CI: `.github/workflows/ci.yml`, which runs the same two commands as above.
+
+## Tools used for Lab 9
+
+Claude Code (the desktop app) with Claude Opus 5.5 (`claude-opus-5-5`), for
+orientation, tracing the code for the Milestone 1 sketch, drafting
+`compose.yaml`, the k6 scripts, and `BOUNDARIES.md`, and running the gates,
+the stack, and the scripts.
