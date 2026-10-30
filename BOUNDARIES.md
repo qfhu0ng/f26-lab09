@@ -248,8 +248,33 @@ race. The two requests were one after the other, so a lock inside
 
 ### What you checked
 
-One thing your agent proposed that you checked (what it proposed, how you
-checked it, and what came of it).
+**What the agent proposed.** That the availability path never reaches
+`TimeInterval.overlaps` and ends in a second overlap test in
+`InMemoryBookingStore.findConflicts` (Milestone 1, disagreement 1).
+
+**How I checked it.** I read `findConflicts` (lines 59–62). It filters on the
+room, `holdsRoom()`, and
+`booking.interval().start().isBefore(windowEnd) && windowStart.isBefore(booking.interval().end())`,
+and never calls `overlaps`. I compared the last two terms with
+`TimeInterval.overlaps` (line 64),
+`start.isBefore(other.end) && other.start.isBefore(end)`. Putting the
+booking's interval in for `this` and the window in for `other` gives the same
+condition. Both are strict, so an interval that ends exactly when the other
+starts does not overlap it, in either order, which is the half-open rule. Then
+I traced the callers: `RoomsHandler.availability` (line 80), then
+`AvailabilityService.freeOnDate` (75), `freeIntervals` (53), and
+`busyIntervals` (41), which calls `bookings.findConflicts`.
+`CampusReservePlatform` (line 50) passes `stores.bookings()` into
+`AvailabilityService`, and `StoreRegistry` (line 25) creates it as an
+`InMemoryBookingStore`. In production code the only direct callers of
+`findConflicts` are `AvailabilityService.isFree` (35) and `busyIntervals`
+(41).
+
+**What came of it.** The claim holds. Availability bypasses `overlaps`, which
+contradicts `AGENTS.md` rule 3 ("the only overlap implementation", with
+availability routed through it). The two conditions are equivalent today,
+though, so this shows a duplicate implementation that breaks the rule, not a
+wrong conflict answer.
 
 ---
 
