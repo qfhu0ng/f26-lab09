@@ -255,19 +255,61 @@ checked it, and what came of it).
 
 ## Milestone 3: One boundary
 
-Take one problem from Milestone 1 or 2 and propose the boundary that fixes it.
+The problem is Finding 2. Each copy's `StoreRegistry` builds its own
+`InMemoryBookingStore` and `InMemoryWaitlistStore` (lines 25–26), and
+`BookingService.requestBooking` decides a room is free with
+`findActiveByRoom` (line 112) and then calls `save` (line 124). The check sees
+one copy, so `load/bookings.js` got the same slot confirmed on both.
 
-**The boundary.** The port, what it promises, and which side implements it. Say what
-moves and what stays.
+**The boundary.** The booking ports decide whether a room is free, in one
+call. `BookingStore` gains `saveIfRoomFree(Booking)`, which stores the booking
+and answers `Saved`, or stores nothing and answers `Conflict` when an active
+booking in the same room overlaps it. Modify and promote use the same call.
+`WaitlistStore.nextSequence()` and the promotion step (save the promoted
+booking, remove its entry) become one transaction in the store. `storage`
+implements the ports against one database that every copy shares, with an
+exclusion constraint on the room and a half-open time range (Postgres
+`EXCLUDE ... WITH &&`). What moves: the deciding room check, from
+`BookingService`'s memory into the store's atomic write, and the bookings and
+waitlist rows, out of every copy. What stays: `BookingRules`, the policy, the
+order of the checks, FIFO promotion, and `ConflictChecker` for the asker's own
+calendar. The in-memory stores stay for tests and the CLI and implement the
+same calls under a lock.
 
-**Who owns the data.** Name the module that owns the data this boundary is about,
-and say what everybody else is allowed to do with it.
+**Who owns the data.** `storage` owns the booking and waitlist rows in the
+shared database. `BookingService` is the only code that writes them, through
+the ports (as `AGENTS.md` rule 4 already says for the waitlist), whether it
+runs in an api copy or in the CLI. Everybody else (the handlers,
+`AvailabilityService`) may only read through the port's queries, and no copy
+keeps booking rows of its own between requests.
 
-**The one invariant that must not cross.** Exactly one, stated so that a reader
-can tell whether a given piece of code violates it.
+**The one invariant that must not cross.** A booking becomes active only
+through the store call that refuses it when an active booking in the same room
+overlaps it. Any code that saves an active booking after deciding from an
+earlier read that the room is free violates it.
 
-**What the boundary costs.** An interface to keep, a second implementation to
-maintain, a performance argument to have again. Include what it leaves unfixed.
+**What the boundary costs.**
 
-Feel free to read the appendix on what a good proposal looks like in the Lab 3 handout
-before you write this section.
+- A second overlap implementation. The database constraint compares ranges
+  itself, against `AGENTS.md` rule 3, so the rule has to name both, and a test
+  has to pin them to the same half-open answers. The alternative,
+  `UNIQUE(room, cell)` with one row per 15-minute cell, costs up to 16 rows per
+  booking, and every modify and cancel rewrites them.
+- Seven write paths change shape: request (line 124), modify (209), cancel
+  (149), promote (306–307), join (332), leave (233), and drop (285).
+- Two implementations to keep in agreement, with contract tests run against
+  both. The shipped gates run no database, so CI needs one.
+- The performance argument again. Every booking and every availability read
+  becomes a round trip, and `findConflicts`, the in-memory shortcut from the
+  performance work, has to be redone as an indexed query.
+- A new single point of failure. When the database is down, no copy can book.
+  Today each copy fails alone.
+- What it leaves unfixed: tokens (Finding 1). The booking cap and the asker's
+  own calendar (`checkAskerLimits`, lines 337–346) are still check-then-insert
+  across rows, so one user on two copies at once can still pass both checks,
+  and that needs a transaction per user. The event log and the outbox stay per
+  copy.
+
+I would take this if CampusReserve has to run as more than one copy. If one
+copy is enough, I would instead make one copy a deployment rule and pay
+nothing: at one copy, `load/bookings.js` passes today.
